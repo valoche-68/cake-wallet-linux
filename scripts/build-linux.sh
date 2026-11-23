@@ -337,7 +337,6 @@ flatpak run --command=sh com.cakewallet.CakeWallet -c '
   ls -lh /app/cake_wallet/lib/
   echo "ALL_FLATPAK_LINKAGE_CHECKS_PASSED"
 '
-flatpak uninstall --system -y --noninteractive com.cakewallet.CakeWallet || true
 
 chown -R "${HOST_UID}:${HOST_GID}" "${OUT_DIR}"
 CONTAINER_EOF
