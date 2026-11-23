@@ -151,6 +151,7 @@ docker run --rm -i --privileged \
   -e "OUT_DIR=${OUT_DIR}" \
   -e "HOST_UID=${HOST_UID}" \
   -e "HOST_GID=${HOST_GID}" \
+  -e "GITHUB_TOKEN=${GITHUB_TOKEN:-}" \
   -v "$WORK_DIR:$WORK_DIR" \
   -v "$OUT_DIR:$OUT_DIR" \
   -v "$SECRETS_TMP:/run/cake-build-secrets.json:ro" \
@@ -158,17 +159,41 @@ docker run --rm -i --privileged \
   "$BUILDER_IMAGE" bash -e << 'CONTAINER_EOF'
 set -euo pipefail
 git config --global --add safe.directory '*'
+git config --global http.lowSpeedLimit 1000
+git config --global http.lowSpeedTime 60
+git config --global http.postBuffer 524288000
+if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+  set +x
+  git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+fi
+
+cw_pub_get() {
+  if flutter pub get --offline; then
+    return 0
+  fi
+  local attempt
+  for attempt in 1 2 3; do
+    echo "Online flutter pub get fallback (attempt ${attempt}/3)..."
+    if flutter pub get; then
+      return 0
+    fi
+    sleep 5
+  done
+  return 1
+}
+export -f cw_pub_get
 
 echo "=== Configuring Cake Wallet for Linux ==="
 pushd scripts/linux
   set +u
   source ./app_env.sh cakewallet
   set -u
+  sed -i 's/flutter pub get/cw_pub_get/g' ./app_config.sh
   ./app_config.sh
 popd
 
 echo "=== Installing Flutter dependencies ==="
-flutter pub get
+cw_pub_get
 
 echo "=== Generating secrets config ==="
 set +x
@@ -235,6 +260,7 @@ print("Validated all 8 required internal crypto salts/keys in lib/.secrets.g.dar
 PYCHECK
 
 echo "=== Generating Dart models ==="
+sed -i 's/flutter pub get/cw_pub_get/g' ./model_generator.sh
 ./model_generator.sh
 
 echo "=== Generating localization ==="
@@ -287,7 +313,7 @@ flatpak build-export export flatpak-build
 flatpak build-bundle export "${OUT_DIR}/Cake_Wallet_${TAG}_Linux.flatpak" com.cakewallet.CakeWallet
 
 echo "=== Verifying Flatpak bundle inside sandbox ==="
-flatpak install -y --noninteractive "${OUT_DIR}/Cake_Wallet_${TAG}_Linux.flatpak"
+flatpak install --system -y --noninteractive "${OUT_DIR}/Cake_Wallet_${TAG}_Linux.flatpak"
 echo "--- version.json ---"
 flatpak run --command=cat com.cakewallet.CakeWallet /app/cake_wallet/data/flutter_assets/version.json
 echo ""
@@ -311,7 +337,7 @@ flatpak run --command=sh com.cakewallet.CakeWallet -c '
   ls -lh /app/cake_wallet/lib/
   echo "ALL_FLATPAK_LINKAGE_CHECKS_PASSED"
 '
-flatpak uninstall -y --noninteractive com.cakewallet.CakeWallet || true
+flatpak uninstall --system -y --noninteractive com.cakewallet.CakeWallet || true
 
 chown -R "${HOST_UID}:${HOST_GID}" "${OUT_DIR}"
 CONTAINER_EOF
