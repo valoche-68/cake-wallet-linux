@@ -146,7 +146,7 @@ else
   printf '{}' > "$SECRETS_TMP"
 fi
 
-docker run --rm --privileged \
+docker run --rm -i --privileged \
   -e "TAG=${TAG}" \
   -e "OUT_DIR=${OUT_DIR}" \
   -e "HOST_UID=${HOST_UID}" \
