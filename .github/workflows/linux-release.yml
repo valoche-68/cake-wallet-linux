@@ -1,0 +1,241 @@
+name: Sync & Build Cake Wallet Linux Release
+
+on:
+  schedule:
+    # Check upstream cake-tech/cake_wallet every 6 hours for new releases
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Official upstream tag to build (leave empty for latest release)"
+        required: false
+        default: ""
+        type: string
+      force_rebuild:
+        description: "Rebuild and overwrite assets even if the release already exists"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: cake-wallet-linux-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  check-upstream:
+    name: Check upstream release & sync fork
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      tag: ${{ steps.check.outputs.tag }}
+      upstream_url: ${{ steps.check.outputs.upstream_url }}
+      upstream_published_at: ${{ steps.check.outputs.upstream_published_at }}
+    steps:
+      - name: Sync fork upstream branches (dev & main)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for branch in dev main; do
+            echo "Syncing branch '${branch}' with cake-tech/cake_wallet..."
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/merge-upstream" -f branch="${branch}" || echo "Skipped/already synced: ${branch}"
+          done
+
+      - name: Check latest official cake-tech/cake_wallet release
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$INPUT_TAG" ]]; then
+            REL_JSON="$(gh api "repos/cake-tech/cake_wallet/releases/tags/${INPUT_TAG}")"
+          else
+            REL_JSON="$(gh api "repos/cake-tech/cake_wallet/releases/latest")"
+          fi
+
+          TAG="$(echo "$REL_JSON" | jq -r '.tag_name')"
+          UPSTREAM_URL="$(echo "$REL_JSON" | jq -r '.html_url')"
+          PUBLISHED_AT="$(echo "$REL_JSON" | jq -r '.published_at')"
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "upstream_url=${UPSTREAM_URL}" >> "$GITHUB_OUTPUT"
+          echo "upstream_published_at=${PUBLISHED_AT}" >> "$GITHUB_OUTPUT"
+
+          echo "Latest upstream release: ${TAG} (${PUBLISHED_AT})"
+
+          SHOULD_BUILD="true"
+          if [[ "$FORCE_REBUILD" != "true" ]]; then
+            if EXISTING="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" 2>/dev/null)"; then
+              HAS_FLATPAK="$(echo "$EXISTING" | jq -r --arg n "Cake_Wallet_${TAG}_Linux.flatpak" '[.assets[].name] | index($n) != null')"
+              HAS_TAR="$(echo "$EXISTING" | jq -r --arg n "Cake_Wallet_${TAG}_Linux.tar.xz" '[.assets[].name] | index($n) != null')"
+              if [[ "$HAS_FLATPAK" == "true" && "$HAS_TAR" == "true" ]]; then
+                echo "Release ${TAG} already published with both Flatpak and tar.xz assets. Nothing to do."
+                SHOULD_BUILD="false"
+              else
+                echo "Release ${TAG} exists but is missing Linux assets; scheduling build."
+              fi
+            fi
+          else
+            echo "Force rebuild requested for ${TAG}."
+          fi
+
+          echo "should_build=${SHOULD_BUILD}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Upstream check"
+            echo "- Upstream release: [\`${TAG}\`](${UPSTREAM_URL}) (published ${PUBLISHED_AT})"
+            echo "- Build required: \`${SHOULD_BUILD}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-and-release:
+    name: Build & Release Linux (${{ needs.check-upstream.outputs.tag }})
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout linux-releases branch
+        uses: actions/checkout@v4
+
+      - name: Free runner disk space for Docker images
+        run: |
+          echo "Disk space before cleanup:"
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost \
+            /usr/share/swift \
+            /usr/local/.ghcup || true
+          docker system prune -af || true
+          echo "Disk space after cleanup:"
+          df -h /
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Cake Wallet Linux (Flatpak + tar.xz + SHA256SUMS)
+        env:
+          PRUNE_DOCKER: "true"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CAKE_BUILD_SECRETS_JSON: ${{ secrets.CAKE_BUILD_SECRETS_JSON }}
+        run: |
+          chmod +x ./scripts/build-linux.sh
+          ./scripts/build-linux.sh "${{ needs.check-upstream.outputs.tag }}" "$PWD/dist"
+
+      - name: Mirror exact upstream tag to fork
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check-upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+          UPSTREAM_SHA="$(jq -r '.upstream_commit' dist/build-metadata.json)"
+          echo "Ensuring tag ${TAG} on ${GITHUB_REPOSITORY} points to official upstream commit ${UPSTREAM_SHA}..."
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists on fork."
+          elif gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${TAG}" \
+              -f sha="${UPSTREAM_SHA}" >/dev/null 2>&1; then
+            echo "Created tag ${TAG} -> ${UPSTREAM_SHA} via GitHub API."
+          else
+            echo "Commit not yet reachable via fork refs; syncing tag from upstream..."
+            SYNC_DIR="$(mktemp -d)"
+            git init -q "$SYNC_DIR"
+            git -C "$SYNC_DIR" remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+            git -C "$SYNC_DIR" remote add upstream "https://github.com/cake-tech/cake_wallet.git"
+            git -C "$SYNC_DIR" fetch -q origin main || true
+            git -C "$SYNC_DIR" fetch -q upstream "refs/tags/${TAG}:refs/tags/${TAG}"
+            git -C "$SYNC_DIR" push origin "refs/tags/${TAG}"
+            rm -rf "$SYNC_DIR"
+          fi
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check-upstream.outputs.tag }}
+          UPSTREAM_URL: ${{ needs.check-upstream.outputs.upstream_url }}
+          PUBLISHED_AT: ${{ needs.check-upstream.outputs.upstream_published_at }}
+        run: |
+          set -euo pipefail
+          UPSTREAM_COMMIT="$(jq -r '.upstream_commit' dist/build-metadata.json)"
+          BUILDER_IMAGE="$(jq -r '.builder_image' dist/build-metadata.json)"
+          DEPS_IMAGE="$(jq -r '.deps_image' dist/build-metadata.json)"
+          RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          cat > release-notes.md << EOF
+          ## Cake Wallet ${TAG} — Automated Linux Build (x86_64)
+
+          Unofficial automated Linux release built directly from the unmodified official upstream tag [\`cake-tech/cake_wallet@${TAG}\`](${UPSTREAM_URL}) (commit [\`${UPSTREAM_COMMIT:0:12}\`](https://github.com/cake-tech/cake_wallet/commit/${UPSTREAM_COMMIT})).
+
+          ### Downloads
+          - **Flatpak (recommended)**: \`Cake_Wallet_${TAG}_Linux.flatpak\`
+          - **Portable archive**: \`Cake_Wallet_${TAG}_Linux.tar.xz\`
+          - **Checksums**: \`SHA256SUMS\`
+
+          ### Installation / Update (Flatpak)
+          \`\`\`bash
+          flatpak install --user -y Cake_Wallet_${TAG}_Linux.flatpak
+          flatpak run com.cakewallet.CakeWallet
+          \`\`\`
+
+          ### Packaging Notes
+          - Zero wallet source code modifications compared to \`cake-tech/cake_wallet@${TAG}\`.
+          - Includes Flatpak runtime compatibility fix for Zcash (\`libbz2.so.1.0 -> libbz2.so.1\`) and \`StartupWMClass=cake_wallet\` for KDE/GNOME dock integration.
+          - Built with a persistent fork build keyset so upgrading between releases of this repository preserves local PINs, wallets, and backups.
+          - *First-time migration from official Cake Tech binaries or another self-build requires restoring from your seed phrase.*
+
+          ### Build Provenance
+          - **Upstream release**: ${UPSTREAM_URL} (published ${PUBLISHED_AT})
+          - **Upstream commit**: \`${UPSTREAM_COMMIT}\`
+          - **Docker builder**: \`${BUILDER_IMAGE}\`
+          - **Native deps cache**: \`${DEPS_IMAGE}\`
+          - **Public CI log**: ${RUN_URL}
+
+          ### SHA-256 Checksums
+          \`\`\`
+          $(cat dist/SHA256SUMS)
+          \`\`\`
+          EOF
+
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Updating existing release ${TAG}..."
+            gh release upload "${TAG}" \
+              "dist/Cake_Wallet_${TAG}_Linux.flatpak" \
+              "dist/Cake_Wallet_${TAG}_Linux.tar.xz" \
+              "dist/SHA256SUMS" \
+              --clobber --repo "${GITHUB_REPOSITORY}"
+            gh release edit "${TAG}" \
+              --title "Cake Wallet ${TAG} (Linux)" \
+              --notes-file release-notes.md \
+              --repo "${GITHUB_REPOSITORY}"
+          else
+            echo "Creating new release ${TAG}..."
+            gh release create "${TAG}" \
+              "dist/Cake_Wallet_${TAG}_Linux.flatpak" \
+              "dist/Cake_Wallet_${TAG}_Linux.tar.xz" \
+              "dist/SHA256SUMS" \
+              --title "Cake Wallet ${TAG} (Linux)" \
+              --notes-file release-notes.md \
+              --latest \
+              --repo "${GITHUB_REPOSITORY}"
+          fi
+
+          {
+            echo "### Release Published: \`${TAG}\`"
+            echo "- Upstream commit: \`${UPSTREAM_COMMIT}\`"
+            echo "- Artifacts:"
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
