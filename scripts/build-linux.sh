@@ -265,12 +265,16 @@ mkdir -p "$STAGE_DIR"
 cp -a "$BUNDLE_DIR/." "$STAGE_DIR/"
 cp -a linux/com.cakewallet.CakeWallet.desktop "$STAGE_DIR/"
 cp -a assets/images/cakewallet_icon_180.png "$STAGE_DIR/com.cakewallet.CakeWallet.png"
-tar -C /tmp -cJf "${OUT_DIR}/Cake_Wallet_${TAG}_Linux.tar.xz" "${ARCHIVE_ROOT}"
+XZ_OPT="-T0" tar -C /tmp -cJf "${OUT_DIR}/Cake_Wallet_${TAG}_Linux.tar.xz" "${ARCHIVE_ROOT}"
 rm -rf "$STAGE_DIR"
 
 echo "=== Ensuring matching Flatpak runtime is available ==="
-RT_VER="$(grep -E "^runtime-version:" com.cakewallet.CakeWallet.yml | head -n1 | sed -E "s/.*['\"]?([0-9]+\.[0-9]+)['\"]?.*/\1/")"
+RT_VER="$(awk -F: '/^runtime-version:/ { gsub(/["'\''[:space:]]/, "", $2); print $2; exit }' com.cakewallet.CakeWallet.yml)"
 echo "Flatpak runtime-version: ${RT_VER}"
+if [[ -z "${RT_VER}" ]]; then
+  echo "ERROR: Could not parse runtime-version from com.cakewallet.CakeWallet.yml" >&2
+  exit 1
+fi
 if ! flatpak info "org.freedesktop.Platform//${RT_VER}" >/dev/null 2>&1; then
   flatpak install -y --noninteractive flathub "org.freedesktop.Platform//${RT_VER}" "org.freedesktop.Sdk//${RT_VER}"
 fi
